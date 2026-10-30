@@ -109,16 +109,38 @@ if ($PSCmdlet.ParameterSetName -eq 'Apk') {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::OpenRead([System.IO.Path]::GetFullPath($ApkPath))
     try {
-        $entries = @($archive.Entries | Where-Object { $_.FullName -match '(^|/)aboutlibraries\.json$' })
-        if ($entries.Count -ne 1) {
-            throw "APK '$ApkPath' must contain exactly one aboutlibraries.json; found $($entries.Count)."
+        # Release resource optimization can rename res/raw/aboutlibraries.json.
+        # Find its schema among JSON resources, then validate every license as usual.
+        $entries = @($archive.Entries | Where-Object {
+            $_.FullName -match '^res/.*\.json$' -or $_.FullName -match '(^|/)aboutlibraries\.json$'
+        })
+        $candidates = [System.Collections.Generic.List[object]]::new()
+        foreach ($entry in $entries) {
+            $namedManifest = $entry.FullName -match '(^|/)aboutlibraries\.json$'
+            $reader = [System.IO.StreamReader]::new($entry.Open())
+            try { $json = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            try {
+                $manifest = $json | ConvertFrom-Json
+            } catch {
+                if ($namedManifest) {
+                    throw "The packaged aboutlibraries.json in '$ApkPath' is invalid: $($_.Exception.Message)"
+                }
+                continue
+            }
+            $hasSchema = $null -ne $manifest -and
+                $null -ne $manifest.PSObject.Properties['libraries'] -and
+                $null -ne $manifest.PSObject.Properties['licenses']
+            if ($namedManifest -and -not $hasSchema) {
+                throw "The packaged aboutlibraries.json in '$ApkPath' is missing its libraries or licenses."
+            }
+            if ($hasSchema) {
+                $candidates.Add([pscustomobject]@{ Entry = $entry; Manifest = $manifest })
+            }
         }
-        $reader = [System.IO.StreamReader]::new($entries[0].Open())
-        try { $json = $reader.ReadToEnd() } finally { $reader.Dispose() }
-        try { $manifest = $json | ConvertFrom-Json } catch {
-            throw "The packaged aboutlibraries.json in '$ApkPath' is invalid: $($_.Exception.Message)"
+        if ($candidates.Count -ne 1) {
+            throw "APK '$ApkPath' must contain exactly one AboutLibraries JSON resource; found $($candidates.Count)."
         }
-        Assert-LicenseManifest $manifest "$ApkPath!/$($entries[0].FullName)"
+        Assert-LicenseManifest $candidates[0].Manifest "$ApkPath!/$($candidates[0].Entry.FullName)"
     } finally {
         $archive.Dispose()
     }

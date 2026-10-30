@@ -1,6 +1,6 @@
 #Requires -Version 7.2
-[CmdletBinding()]
 param(
+    [switch]$Debug,
     [switch]$SkipTests,
     [string]$JavaHome,
     [string]$AndroidSdk,
@@ -13,23 +13,35 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repoRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
 
+# This simple parameter block reserves -Debug for the build variant.
+# Reject unbound arguments explicitly instead of silently ignoring typos.
+if ($args.Count -gt 0) { throw 'Unknown build argument. Use -Help to see the supported options.' }
+
 if ($Help) {
     @'
-Usage: pwsh ./build.ps1 [-SkipTests] [-JavaHome <jdk>] [-AndroidSdk <sdk>] [-Version <version>]
+Usage: pwsh ./build.ps1 [-Debug] [-SkipTests] [-JavaHome <jdk>] [-AndroidSdk <sdk>] [-Version <version>]
 
-Builds a Debug APK and runs app unit tests by default. Nothing is installed or deployed.
+Builds a signed, optimized Release APK and runs matching unit tests by default.
+Use -Debug for a Debug APK. Nothing is installed or deployed.
 Requires PowerShell 7.2+ and an Android SDK with the project's compile API and build tools.
 Finds a matching JDK, or downloads a verified portable Temurin JDK on Windows.
+Reuses configured release signing, or creates a persistent fork key in .signing/.
+Back up .signing/ for future updates; it is private and never committed or cleaned.
 Cache and logs: .build/    APK, SHA256 and build information: _artifacts/
 
 Examples:
   ./build.ps1
+  ./build.ps1 -Debug
   ./build.ps1 -SkipTests
   ./build.ps1 -Version 0.20.0-alien21.1
   ./build.ps1 -JavaHome C:\Java\jdk-21 -AndroidSdk C:\Android\Sdk
 '@ | Write-Output
     return
 }
+
+$configuration = if ($Debug) { 'Debug' } else { 'Release' }
+$variant = $configuration.ToLowerInvariant()
+$expectedApplicationId = if ($Debug) { 'org.jellyfin.androidtv.debug' } else { 'org.jellyfin.androidtv' }
 
 function Get-OutputDirectory([string]$RelativePath) {
     $path = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $RelativePath))
@@ -190,30 +202,54 @@ try {
     Push-Location -LiteralPath $repoRoot
     $locationChanged = $true
     $gradle = Join-Path $repoRoot $(if ($IsWindows) { 'gradlew.bat' } else { 'gradlew' })
-    $gradleArgs = @(':app:assembleDebug')
-    if (-not $SkipTests) { $gradleArgs += ':app:testDebugUnitTest' }
-    $gradleArgs += @('--console=plain', ('-Porg.gradle.java.installations.paths=' + $jdk),
+    $gradleArgs = @(':app:assemble' + $configuration)
+    if (-not $SkipTests) {
+        $gradleArgs += ":app:test${configuration}UnitTest"
+        # AGP 9 otherwise creates unit tests only for the default tested build type.
+        if (-not $Debug) { $gradleArgs += '-Pandroid.onlyEnableUnitTestForTheTestedBuildType=false' }
+    }
+    $gradleArgs += @('--console=plain', '--no-configuration-cache', ('-Porg.gradle.java.installations.paths=' + $jdk),
         '--init-script', (Join-Path $repoRoot 'build-support/aboutlibraries.init.gradle'),
         ('-Pandroidtv.licenseConfig=' + $licenseConfig),
         '-Dorg.gradle.jvmargs=-Xmx2048m -Dsun.net.client.defaultConnectTimeout=15000 -Dsun.net.client.defaultReadTimeout=15000')
+    $signingReportPath = Join-Path $cache 'release-signing.json'
+    if (-not $Debug) {
+        $signingDirectory = Get-OutputDirectory '.signing'
+        $keytool = Join-Path $jdk $(if ($IsWindows) { 'bin/keytool.exe' } else { 'bin/keytool' })
+        $gradleArgs += @('--init-script', (Join-Path $repoRoot 'build-support/release-signing.init.gradle'),
+            ('-Pandroidtv.signingDirectory=' + $signingDirectory),
+            ('-Pandroidtv.signingReport=' + $signingReportPath),
+            ('-Pandroidtv.keytool=' + $keytool))
+    }
     if ($Version) { $gradleArgs += '-Pjellyfin.version=' + $Version }
     $logPath = Join-Path $logs ('build-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '.log')
     & $gradle @gradleArgs 2>&1 | Tee-Object -FilePath $logPath
     if ($LASTEXITCODE -ne 0) { throw "Gradle failed with exit code $LASTEXITCODE. See $logPath" }
 
-    $apkDirectory = Join-Path $repoRoot 'app/build/outputs/apk/debug'
+    $apkDirectory = Join-Path $repoRoot ('app/build/outputs/apk/' + $variant)
     $metadata = [System.IO.File]::ReadAllText((Join-Path $apkDirectory 'output-metadata.json')) | ConvertFrom-Json
-    if ($metadata.applicationId -ne 'org.jellyfin.androidtv.debug' -or @($metadata.elements).Count -ne 1) { throw 'Expected one Debug APK in Gradle output metadata.' }
+    if ($metadata.applicationId -ne $expectedApplicationId -or @($metadata.elements).Count -ne 1) { throw "Expected one $configuration APK in Gradle output metadata." }
     $apkElement = @($metadata.elements)[0]
     $apkPath = [System.IO.Path]::GetFullPath((Join-Path $apkDirectory $apkElement.outputFile))
     if (-not $apkPath.StartsWith([System.IO.Path]::GetFullPath($apkDirectory) + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
         -not (Test-Path -LiteralPath $apkPath -PathType Leaf)) { throw 'APK output metadata references a missing or unexpected file.' }
     & $licenseHelper -ApkPath $apkPath
+    $verificationArguments = @{ ApkPath = $apkPath; AndroidSdk = $sdk; Configuration = $configuration }
+    $signingMode = 'debug'
+    if (-not $Debug) {
+        $signingReport = [System.IO.File]::ReadAllText($signingReportPath) | ConvertFrom-Json
+        if ($signingReport.mode -notin @('managed', 'external') -or $signingReport.certificateSha256 -notmatch '^[a-fA-F0-9]{64}$') {
+            throw 'Release signing report is missing a valid signing identity.'
+        }
+        $signingMode = $signingReport.mode
+        $verificationArguments.ExpectedCertificateSha256 = $signingReport.certificateSha256
+    }
+    $apkVerification = & (Join-Path $repoRoot 'build-support/verify-apk.ps1') @verificationArguments
 
     $testSummary = $null
     if (-not $SkipTests) {
         $testSummary = [ordered]@{ tests = 0; failures = 0; errors = 0; skipped = 0 }
-        $results = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'app/build/test-results/testDebugUnitTest') -Filter 'TEST-*.xml')
+        $results = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot "app/build/test-results/test${configuration}UnitTest") -Filter 'TEST-*.xml')
         if ($results.Count -eq 0) { throw 'Gradle finished without app unit test results.' }
         foreach ($result in $results) {
             $xml = [xml][System.IO.File]::ReadAllText($result.FullName)
@@ -226,10 +262,11 @@ try {
     Copy-Item -LiteralPath $apkPath -Destination $packagedApk -Force
     $hash = (Get-FileHash -LiteralPath $packagedApk -Algorithm SHA256).Hash.ToLowerInvariant()
     [System.IO.File]::WriteAllText(($packagedApk + '.sha256'), ($hash + '  ' + [System.IO.Path]::GetFileName($packagedApk) + "`n"))
-    $buildInfo = [ordered]@{ createdUtc = [DateTime]::UtcNow.ToString('o'); configuration = 'Debug'; applicationId = $metadata.applicationId; version = $apkElement.versionName; versionCode = $apkElement.versionCode; sha256 = $hash; jdk = $jdk; androidSdk = $sdk; testsRequested = (-not $SkipTests); tests = $testSummary; log = $logPath }
+    $buildInfo = [ordered]@{ createdUtc = [DateTime]::UtcNow.ToString('o'); configuration = $configuration; applicationId = $metadata.applicationId; version = $apkElement.versionName; versionCode = $apkElement.versionCode; sha256 = $hash; signingMode = $signingMode; signature = $apkVerification; jdk = $jdk; androidSdk = $sdk; testsRequested = (-not $SkipTests); tests = $testSummary; log = $logPath }
     [System.IO.File]::WriteAllText(($packagedApk + '.build.json'), ($buildInfo | ConvertTo-Json -Depth 10))
     Write-Host "APK: $packagedApk"
     Write-Host "SHA256: $hash"
+    Write-Host "APK signer SHA256: $($apkVerification.certificateSha256) ($configuration)"
     if ($SkipTests) { Write-Host 'Unit tests: skipped by -SkipTests.' } else { Write-Host "Unit tests: $($testSummary.tests), failures: 0." }
 }
 catch {

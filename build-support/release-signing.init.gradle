@@ -1,0 +1,294 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import org.gradle.api.GradleException
+
+import java.nio.charset.StandardCharsets
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.AclEntry
+import java.nio.file.attribute.AclEntryFlag
+import java.nio.file.attribute.AclEntryPermission
+import java.nio.file.attribute.AclEntryType
+import java.nio.file.attribute.AclFileAttributeView
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermissions
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.PrivateKey
+import java.security.SecureRandom
+import java.util.concurrent.TimeUnit
+
+// Secrets stay inside this Gradle process and the keytool child's environment.
+// The report contains only public identity information for the APK verifier.
+class AndroidTvReleaseSigning {
+    static final String STORE_NAME = 'fork-release.p12'
+    static final String CREDENTIALS_NAME = 'credentials.json'
+    static final String IDENTITY_NAME = 'identity.json'
+    static final String KEY_ALIAS = 'alien21-fork-release'
+    static final String STORE_PASSWORD_ENV = 'ANDROIDTV_MANAGED_STORE_PASSWORD'
+    static final String KEY_PASSWORD_ENV = 'ANDROIDTV_MANAGED_KEY_PASSWORD'
+    static final List<String> PROPERTY_NAMES = [
+        'keystore.file', 'keystore.password', 'signing.key.alias', 'signing.key.password'
+    ]
+
+    static boolean isWindows() {
+        System.getProperty('os.name').toLowerCase(Locale.ROOT).startsWith('windows')
+    }
+
+    static void requireRegularFile(Path path, String description) {
+        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+            throw new GradleException("${description} is missing or is not a regular file. No replacement key was generated.")
+        }
+    }
+
+    static int runBounded(ProcessBuilder builder, long seconds, String description) {
+        builder.redirectOutput(ProcessBuilder.Redirect.DISCARD)
+        builder.redirectError(ProcessBuilder.Redirect.DISCARD)
+        Process process = null
+        try {
+            process = builder.start()
+            if (!process.waitFor(seconds, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor(10, TimeUnit.SECONDS)
+                throw new GradleException("${description} timed out. Existing signing files were preserved.")
+            }
+            return process.exitValue()
+        } catch (InterruptedException ignored) {
+            if (process != null) process.destroyForcibly()
+            Thread.currentThread().interrupt()
+            throw new GradleException("${description} was interrupted. Existing signing files were preserved.")
+        } catch (IOException ignored) {
+            throw new GradleException("${description} could not be started. Existing signing files were preserved.")
+        }
+    }
+
+    static void protectPath(Path path, boolean directory) {
+        if (isWindows()) {
+            def account = Class.forName('com.sun.security.auth.module.NTSystem').getDeclaredConstructor().newInstance()
+            String accountName = account.domain ? account.domain + '\\' + account.name : account.name
+            def principal = path.fileSystem.userPrincipalLookupService.lookupPrincipalByName(accountName)
+            if (directory) {
+                String systemRoot = System.getenv('SystemRoot') ?: System.getenv('WINDIR')
+                if (!systemRoot) throw new GradleException('Windows directory was not available for signing ACL protection.')
+                File icacls = new File(systemRoot, 'System32/icacls.exe')
+                int result = runBounded(new ProcessBuilder([
+                    icacls.absolutePath, path.toString(), '/inheritance:r', '/grant:r',
+                    '*' + account.userSID + ':(OI)(CI)F', '/Q'
+                ]), 30, 'Signing directory ACL protection')
+                if (result != 0) throw new GradleException('The private signing directory could not be restricted to the current user.')
+            }
+            def view = Files.getFileAttributeView(path, AclFileAttributeView, LinkOption.NOFOLLOW_LINKS)
+            if (view == null) throw new GradleException('The signing filesystem does not support Windows ACL protection.')
+            def entry = AclEntry.newBuilder().setType(AclEntryType.ALLOW).setPrincipal(principal)
+                .setPermissions(EnumSet.allOf(AclEntryPermission))
+            if (directory) entry.setFlags(AclEntryFlag.FILE_INHERIT, AclEntryFlag.DIRECTORY_INHERIT)
+            view.setAcl(Collections.singletonList(entry.build()))
+            if (view.acl.any { it.type() == AclEntryType.ALLOW && it.principal() != principal }) {
+                throw new GradleException('The signing ACL still permits another user; signing was stopped.')
+            }
+        } else {
+            def view = Files.getFileAttributeView(path, PosixFileAttributeView, LinkOption.NOFOLLOW_LINKS)
+            if (view == null) throw new GradleException('The signing filesystem does not support private POSIX permissions.')
+            Files.setPosixFilePermissions(path, PosixFilePermissions.fromString(directory ? 'rwx------' : 'rw-------'))
+        }
+    }
+
+    static void writePrivateJsonNew(Path path, Map value) {
+        Files.createFile(path)
+        protectPath(path, false)
+        Files.writeString(path, JsonOutput.prettyPrint(JsonOutput.toJson(value)) + '\n', StandardCharsets.UTF_8,
+            StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
+    }
+
+    static Map readJson(Path path, String description) {
+        requireRegularFile(path, description)
+        try {
+            def value = new JsonSlurper().parse(path.toFile(), 'UTF-8')
+            if (!(value instanceof Map)) throw new IllegalArgumentException()
+            return value as Map
+        } catch (Exception ignored) {
+            throw new GradleException("${description} is invalid. Restore the complete signing backup; no replacement key was generated.")
+        }
+    }
+
+    static String certificateFingerprint(File store, String password, String alias, String keyPassword,
+                                         String storeType, String expectedFingerprint = null) {
+        requireRegularFile(store.toPath(), 'Release keystore')
+        char[] storeCharacters = password.toCharArray()
+        char[] keyCharacters = keyPassword.toCharArray()
+        try {
+            KeyStore keyStore
+            if (storeType) {
+                keyStore = KeyStore.getInstance(storeType)
+                Files.newInputStream(store.toPath()).withCloseable { keyStore.load(it, storeCharacters) }
+            } else {
+                keyStore = KeyStore.getInstance(store, storeCharacters)
+            }
+            if (!keyStore.isKeyEntry(alias) || !(keyStore.getKey(alias, keyCharacters) instanceof PrivateKey)) {
+                throw new GradleException('The release signing alias does not contain an accessible private key.')
+            }
+            def certificate = keyStore.getCertificate(alias)
+            if (certificate == null) throw new GradleException('The release signing alias has no certificate.')
+            String fingerprint = MessageDigest.getInstance('SHA-256').digest(certificate.encoded)
+                .collect { String.format('%02x', it & 0xff) }.join()
+            if (expectedFingerprint != null && fingerprint != expectedFingerprint.toLowerCase(Locale.ROOT)) {
+                throw new GradleException('The managed release key differs from its saved certificate identity. Restore the original signing backup.')
+            }
+            return fingerprint
+        } catch (GradleException failure) {
+            throw failure
+        } catch (Exception ignored) {
+            throw new GradleException('The release keystore or private-key credentials are invalid. Signing stopped without generating a replacement key.')
+        } finally {
+            Arrays.fill(storeCharacters, (char) 0)
+            Arrays.fill(keyCharacters, (char) 0)
+        }
+    }
+
+    static void refuseReplacementOfPreviousIdentity(Path report) {
+        if (!Files.exists(report, LinkOption.NOFOLLOW_LINKS)) return
+        Map previous = readJson(report, 'Previous public signing report')
+        if (!(previous.mode in ['managed', 'external']) ||
+            !(previous.certificateSha256 instanceof String) ||
+            !(previous.certificateSha256 ==~ /[a-fA-F0-9]{64}/)) {
+            throw new GradleException('The previous signing report is invalid; initialization of a new signing identity was refused.')
+        }
+        throw new GradleException('A previous release signing identity exists but its signing configuration or managed key is missing. Restore the original signing backup or explicitly configure the intended external key.')
+    }
+
+    static Map managedIdentity(Path directory, Path report, File keytool) {
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+            throw new GradleException('The managed signing directory must exist and must not be a symbolic link.')
+        }
+        protectPath(directory, true)
+        List<String> entries
+        Files.list(directory).withCloseable { stream -> entries = stream.map { it.fileName.toString() }.toList() }
+        Path store = directory.resolve(STORE_NAME)
+        Path credentials = directory.resolve(CREDENTIALS_NAME)
+        Path identity = directory.resolve(IDENTITY_NAME)
+        if (entries.isEmpty()) {
+            refuseReplacementOfPreviousIdentity(report)
+            requireRegularFile(keytool.toPath(), 'JDK keytool')
+            Path marker = directory.resolve('.initializing')
+            Files.createFile(marker)
+            protectPath(marker, false)
+            byte[] random = new byte[32]
+            new SecureRandom().nextBytes(random)
+            String password = Base64.urlEncoder.withoutPadding().encodeToString(random)
+            Arrays.fill(random, (byte) 0)
+            writePrivateJsonNew(credentials, [password: password])
+            ProcessBuilder builder = new ProcessBuilder([
+                keytool.absolutePath, '-genkeypair', '-alias', KEY_ALIAS, '-keyalg', 'RSA', '-keysize', '3072',
+                '-validity', '10000', '-dname', 'CN=Alien21 Jellyfin Android TV Fork', '-storetype', 'PKCS12',
+                '-keystore', store.toString(), '-storepass:env', STORE_PASSWORD_ENV,
+                '-keypass:env', KEY_PASSWORD_ENV, '-noprompt'
+            ])
+            builder.environment().put(STORE_PASSWORD_ENV, password)
+            builder.environment().put(KEY_PASSWORD_ENV, password)
+            int result
+            try {
+                result = runBounded(builder, 120, 'Managed release key generation')
+            } finally {
+                builder.environment().remove(STORE_PASSWORD_ENV)
+                builder.environment().remove(KEY_PASSWORD_ENV)
+            }
+            if (result != 0) throw new GradleException('Managed release key generation failed. The partial signing state was preserved and will not be replaced automatically.')
+            protectPath(store, false)
+            String fingerprint = certificateFingerprint(store.toFile(), password, KEY_ALIAS, password, 'PKCS12')
+            writePrivateJsonNew(identity, [schema: 1, keyAlias: KEY_ALIAS, keystoreFile: STORE_NAME, certificateSha256: fingerprint])
+            Files.delete(marker)
+        } else if (entries.toSet() != [STORE_NAME, CREDENTIALS_NAME, IDENTITY_NAME].toSet()) {
+            throw new GradleException('The managed signing directory contains partial or unexpected state. Restore the complete original signing backup; no new key was generated.')
+        }
+        [store, credentials, identity].each {
+            requireRegularFile(it, 'Managed signing file')
+            protectPath(it, false)
+        }
+        Map publicIdentity = readJson(identity, 'Managed signing identity')
+        Map privateCredentials = readJson(credentials, 'Managed signing credentials')
+        if (publicIdentity.schema != 1 || publicIdentity.keyAlias != KEY_ALIAS || publicIdentity.keystoreFile != STORE_NAME ||
+            !(publicIdentity.certificateSha256 instanceof String) || !(publicIdentity.certificateSha256 ==~ /[a-fA-F0-9]{64}/) ||
+            !(privateCredentials.password instanceof String) || privateCredentials.password.trim().isEmpty()) {
+            throw new GradleException('The managed signing identity or credentials are incomplete. Restore the complete original signing backup; no new key was generated.')
+        }
+        String password = privateCredentials.password
+        String fingerprint = certificateFingerprint(store.toFile(), password, KEY_ALIAS, password, 'PKCS12', publicIdentity.certificateSha256)
+        if (Files.exists(report, LinkOption.NOFOLLOW_LINKS)) {
+            Map previous = readJson(report, 'Previous public signing report')
+            if (!(previous.mode in ['managed', 'external']) ||
+                !(previous.certificateSha256 instanceof String) ||
+                !(previous.certificateSha256 ==~ /[a-fA-F0-9]{64}/)) {
+                throw new GradleException('The previous signing report is invalid; managed signing was stopped.')
+            }
+            if (fingerprint != previous.certificateSha256.toLowerCase(Locale.ROOT)) {
+                throw new GradleException('The managed release key differs from the last selected signing identity. Restore the matching key or explicitly configure the intended external signing identity.')
+            }
+        }
+        return [store: store.toFile(), password: password, alias: KEY_ALIAS, fingerprint: fingerprint]
+    }
+
+    static void writeReport(Path report, Map value) {
+        if (Files.exists(report, LinkOption.NOFOLLOW_LINKS)) requireRegularFile(report, 'Public signing report')
+        Path temporary = Files.createTempFile(report.parent, 'release-signing-', '.json.tmp')
+        try {
+            Files.writeString(temporary, JsonOutput.prettyPrint(JsonOutput.toJson(value)) + '\n', StandardCharsets.UTF_8)
+            try {
+                Files.move(temporary, report, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (AtomicMoveNotSupportedException ignored) {
+                Files.move(temporary, report, StandardCopyOption.REPLACE_EXISTING)
+            }
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+
+    static void configure(def project, def android) {
+        Map values = PROPERTY_NAMES.collectEntries { name ->
+            def configured = project.findProperty(name)
+            if (configured == null) configured = System.getenv(name.toUpperCase(Locale.ROOT).replace('.', '_'))
+            [(name): configured == null ? null : configured.toString()]
+        }
+        Path report = project.rootProject.file(project.property('androidtv.signingReport').toString()).toPath().toAbsolutePath().normalize()
+        def release = android.buildTypes.getByName('release')
+        if (values.values().any { it != null }) {
+            if (values.values().any { it == null || it.trim().isEmpty() }) {
+                throw new GradleException('External release signing configuration is incomplete or blank. Configure all four signing properties; a managed replacement key will not be generated.')
+            }
+            def signing = release.signingConfig ?: android.signingConfigs.findByName('release')
+            if (signing == null || signing.storeFile == null || !signing.storePassword || !signing.keyAlias || !signing.keyPassword) {
+                throw new GradleException('The configured external release signing config is incomplete. No managed replacement key was generated.')
+            }
+            String fingerprint = certificateFingerprint(signing.storeFile, signing.storePassword, signing.keyAlias,
+                signing.keyPassword, signing.storeType)
+            release.signingConfig = signing
+            writeReport(report, [mode: 'external', certificateSha256: fingerprint,
+                keyAlias: signing.keyAlias, keystoreFile: signing.storeFile.absolutePath])
+            return
+        }
+        Path directory = project.rootProject.file(project.property('androidtv.signingDirectory').toString()).toPath().toAbsolutePath().normalize()
+        File keytool = project.rootProject.file(project.property('androidtv.keytool').toString())
+        Map managed = managedIdentity(directory, report, keytool)
+        def signing = android.signingConfigs.findByName('alien21ManagedRelease') ?: android.signingConfigs.create('alien21ManagedRelease')
+        signing.storeFile = managed.store
+        signing.storePassword = managed.password
+        signing.keyAlias = managed.alias
+        signing.keyPassword = managed.password
+        signing.storeType = 'PKCS12'
+        release.signingConfig = signing
+        writeReport(report, [mode: 'managed', certificateSha256: managed.fingerprint,
+            keyAlias: managed.alias, keystoreFile: managed.store.absolutePath])
+    }
+}
+
+gradle.beforeProject { project ->
+    if (project.path != ':app') return
+    project.pluginManager.withPlugin('com.android.application') {
+        project.extensions.getByName('androidComponents').finalizeDsl { android ->
+            AndroidTvReleaseSigning.configure(project, android)
+        }
+    }
+}

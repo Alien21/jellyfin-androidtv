@@ -76,22 +76,60 @@ Assert-Rejected 'truncated known license fails' { & $helper -ManifestPath $manif
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$apkPath = Join-Path $testRoot 'fixture.apk'
-$archive = [System.IO.Compression.ZipFile]::Open($apkPath, [System.IO.Compression.ZipArchiveMode]::Create)
-try {
-    $entry = $archive.CreateEntry('res/raw/aboutlibraries.json')
-    $writer = [System.IO.StreamWriter]::new($entry.Open(), $encoding)
-    try { $writer.Write(($valid | ConvertTo-Json -Depth 12)) } finally { $writer.Dispose() }
-} finally {
-    $archive.Dispose()
+
+function New-TestApk {
+    param([string]$Name, [System.Collections.IDictionary]$Resources)
+    $path = Join-Path $testRoot $Name
+    $archive = [System.IO.Compression.ZipFile]::Open($path, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($name in $Resources.Keys) {
+            $entry = $archive.CreateEntry($name)
+            $writer = [System.IO.StreamWriter]::new($entry.Open(), $encoding)
+            try { $writer.Write([string]$Resources[$name]) } finally { $writer.Dispose() }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+    return $path
 }
+
+$validJson = $valid | ConvertTo-Json -Depth 12
+$apkPath = New-TestApk 'fixture.apk' ([ordered]@{ 'res/raw/aboutlibraries.json' = $validJson })
 & $helper -ApkPath $apkPath
 $script:passed++
 Write-Host 'PASS: validator checks the actual manifest inside the APK archive'
 
-$missingApk = Join-Path $testRoot 'missing-resource.apk'
-$archive = [System.IO.Compression.ZipFile]::Open($missingApk, [System.IO.Compression.ZipArchiveMode]::Create)
-$archive.Dispose()
-Assert-Rejected 'APK missing its license resource fails' { & $helper -ApkPath $missingApk } 'exactly one aboutlibraries.json'
+$missingApk = New-TestApk 'missing-resource.apk' ([ordered]@{})
+Assert-Rejected 'APK missing its license resource fails' { & $helper -ApkPath $missingApk } 'exactly one AboutLibraries JSON resource'
+
+$renamedApk = New-TestApk 'optimized-resources.apk' ([ordered]@{
+    'res/M7.json' = $validJson
+    'res/unrelated.json' = '{"version":1,"name":"unrelated application data"}'
+})
+& $helper -ApkPath $renamedApk
+$script:passed++
+Write-Host 'PASS: optimized resource name is discovered while unrelated JSON is ignored'
+
+$ambiguousApk = New-TestApk 'ambiguous-resources.apk' ([ordered]@{
+    'res/raw/aboutlibraries.json' = $validJson
+    'res/M7.json' = $validJson
+})
+Assert-Rejected 'named and renamed license resources are ambiguous' { & $helper -ApkPath $ambiguousApk } 'found 2'
+
+$invalidNamedApk = New-TestApk 'invalid-named-resource.apk' ([ordered]@{
+    'res/raw/aboutlibraries.json' = '{invalid json'
+    'res/M7.json' = $validJson
+})
+Assert-Rejected 'malformed named manifest is not hidden by a valid fallback' { & $helper -ApkPath $invalidNamedApk } 'is invalid'
+
+$incompleteJson = New-Manifest -Text '' | ConvertTo-Json -Depth 12
+$incompleteApk = New-TestApk 'incomplete-renamed-resource.apk' ([ordered]@{ 'res/M7.json' = $incompleteJson })
+Assert-Rejected 'renamed resource still requires full license text' { & $helper -ApkPath $incompleteApk } 'has no full text'
+
+$ambiguousIncompleteApk = New-TestApk 'ambiguous-incomplete-resources.apk' ([ordered]@{
+    'res/M7.json' = $validJson
+    'res/Z1.json' = $incompleteJson
+})
+Assert-Rejected 'incomplete alternative manifest still causes ambiguity' { & $helper -ApkPath $ambiguousIncompleteApk } 'found 2'
 
 Write-Host "$script:passed license helper regression checks passed."
