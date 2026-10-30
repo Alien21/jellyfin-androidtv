@@ -44,6 +44,11 @@ requests! If you have a larger feature in mind please open an issue so we can di
 
 ## Building
 
+For this fork, use `./build.ps1` from PowerShell 7.2+ for a complete Debug APK
+build, unit tests and verified packaging. It discovers the Android SDK and
+provides the required JDK and license cache without external artifact paths.
+See [README.build.md](README.build.md) for prerequisites, options and outputs.
+
 The app uses Gradle and requires the Android SDK. We recommend using Android Studio, which includes all required dependencies, for
 development and building. For manual building without Android Studio make sure a compatible JDK and Android SDK are installed and in your
 PATH, then use the Gradle wrapper (`./gradlew`) to build the project with the `assembleDebug` Gradle task to generate an apk file:

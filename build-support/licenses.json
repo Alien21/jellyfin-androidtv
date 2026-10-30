@@ -1,0 +1,68 @@
+{
+  "licenses": [
+    {
+      "hash": "Apache-2.0",
+      "name": "Apache License 2.0",
+      "url": "https://spdx.org/licenses/Apache-2.0.html",
+      "spdxId": "Apache-2.0",
+      "source": "AboutLibraries SPDX mapping; AndroidX and Kotlin dependencies",
+      "textUrls": [
+        "https://raw.githubusercontent.com/spdx/license-list-data/refs/heads/main/text/Apache-2.0.txt",
+        "https://spdx.org/licenses/Apache-2.0.txt"
+      ],
+      "textContains": "Apache License",
+      "minimumLength": 9000
+    },
+    {
+      "hash": "BSD-2-Clause",
+      "name": "BSD 2-Clause \"Simplified\" License",
+      "url": "https://spdx.org/licenses/BSD-2-Clause.html",
+      "spdxId": "BSD-2-Clause",
+      "source": "AboutLibraries SPDX mapping; com.atlassian.commonmark:commonmark",
+      "textUrls": [
+        "https://raw.githubusercontent.com/spdx/license-list-data/refs/heads/main/text/BSD-2-Clause.txt",
+        "https://spdx.org/licenses/BSD-2-Clause.txt"
+      ],
+      "textContains": "Redistribution and use in source and binary forms",
+      "minimumLength": 1000
+    },
+    {
+      "hash": "GPL-3.0-only",
+      "name": "GNU General Public License v3.0 only",
+      "url": "https://spdx.org/licenses/GPL-3.0-only.html",
+      "spdxId": "GPL-3.0-only",
+      "source": "AboutLibraries SPDX mapping; org.jellyfin.media3:media3-ffmpeg-decoder",
+      "textUrls": [
+        "https://raw.githubusercontent.com/spdx/license-list-data/refs/heads/main/text/GPL-3.0-only.txt",
+        "https://spdx.org/licenses/GPL-3.0-only.txt"
+      ],
+      "textContains": "GNU GENERAL PUBLIC LICENSE",
+      "minimumLength": 30000
+    },
+    {
+      "hash": "MIT",
+      "name": "MIT License",
+      "url": "https://spdx.org/licenses/MIT.html",
+      "spdxId": "MIT",
+      "source": "AboutLibraries SPDX mapping; ass-kt, ass-media, checker-qual and slf4j-api",
+      "textUrls": [
+        "https://raw.githubusercontent.com/spdx/license-list-data/refs/heads/main/text/MIT.txt",
+        "https://spdx.org/licenses/MIT.txt"
+      ],
+      "textContains": "Permission is hereby granted",
+      "minimumLength": 1000
+    },
+    {
+      "hash": "e0deb79316377348046c5a35d1eba645",
+      "name": "GNU Lesser General Public License v3.0",
+      "url": "https://www.gnu.org/licenses/lgpl-3.0.txt",
+      "source": "org.jellyfin.sdk dependency POM name/URL; original AboutLibraries custom hash preserved",
+      "textUrls": [
+        "https://www.gnu.org/licenses/lgpl-3.0.txt",
+        "https://raw.githubusercontent.com/spdx/license-list-data/refs/heads/main/text/LGPL-3.0-only.txt"
+      ],
+      "textContains": "GNU LESSER GENERAL PUBLIC LICENSE",
+      "minimumLength": 7000
+    }
+  ]
+}

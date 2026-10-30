@@ -1,0 +1,20 @@
+// Public AboutLibraries input API; dependency discovery and online resolution stay enabled.
+def configuredPath = gradle.startParameter.projectProperties['androidtv.licenseConfig']
+
+gradle.beforeProject { project ->
+    project.pluginManager.withPlugin('com.mikepenz.aboutlibraries.plugin.android') {
+        def licenseConfig = configuredPath
+            ? project.rootProject.file(configuredPath)
+            : new File(project.rootProject.projectDir, '.build/licenses')
+        if (!new File(licenseConfig, 'licenses').isDirectory()) {
+            throw new GradleException('License cache is missing. Run build-support/prepare-licenses.ps1 first.')
+        }
+
+        def aboutLibraries = project.extensions.getByName('aboutLibraries')
+        def existing = aboutLibraries.collect.configPath.orNull
+        if (existing != null && existing.asFile.canonicalFile != licenseConfig.canonicalFile) {
+            throw new GradleException('An existing AboutLibraries configPath must be combined with the build license cache.')
+        }
+        aboutLibraries.collect.configPath.set(licenseConfig)
+    }
+}
